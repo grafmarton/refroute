@@ -1,0 +1,1064 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Reference Route Tool</title>
+  <link rel="stylesheet" href="vendor/leaflet.css">
+  <link rel="stylesheet" href="vendor/leaflet-routing-machine.css">
+  <style>
+    html, body { margin: 0; height: 100%; }
+    #map { position: absolute; inset: 0; }
+    #panel {
+      position: absolute; top: 10px; left: 10px; z-index: 1000;
+      background: white; padding: 10px 12px; max-height: 80vh; overflow: auto;
+      border: 1px solid #ccc; border-radius: 4px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+      font-family: sans-serif; font-size: 13px;
+    }
+    #panel h1 { margin: 0 0 8px 0; font-size: 16px; }
+    #trace-input { width: 220px; }
+    #trace-info, #status { margin-top: 6px; font-size: 12px; color: #555; }
+    #waypoint-list { margin: 6px 0 8px 18px; padding: 0; }
+    #waypoint-list li { display: flex; align-items: center; gap: 4px; margin-bottom: 2px; }
+    button { font-size: 12px; margin-right: 4px; }
+    #error-banner {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 2000; display: none;
+      background: #f8d7da; color: #721c24; border-bottom: 1px solid #f5c6cb;
+      padding: 8px 12px; font-family: sans-serif; font-size: 13px;
+      align-items: center; justify-content: center; gap: 8px;
+    }
+    #error-banner.show { display: flex; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="panel">
+    <h1>Reference Route Tool</h1>
+    <input type="file" id="trace-input" accept=".csv,.txt,.tsv,.json,.geojson">
+    <div id="trace-info"></div>
+    <ol id="waypoint-list"></ol>
+    <div id="toolbar">
+      <button type="button" id="btn-export">Export GeoJSON</button>
+      <button type="button" id="btn-zoom-all">Zoom to route</button>
+      <button type="button" id="btn-save-waypoints">Save waypoints</button>
+      <button type="button" id="btn-load-waypoints">Load waypoints</button>
+    </div>
+    <input type="file" id="waypoint-file" accept=".json,application/json" style="display:none">
+    <div id="status"></div>
+  </div>
+  <div id="error-banner">
+    <span id="error-msg"></span>
+    <button type="button" id="error-retry">Retry</button>
+    <button type="button" id="error-dismiss">Dismiss</button>
+  </div>
+  <script src="vendor/leaflet.js"></script>
+  <script src="vendor/leaflet-routing-machine.js"></script>
+  <script>
+    (function() {
+      var hasDOM = (typeof document !== 'undefined');
+
+      function stripBOM(s) {
+        if (s && s.charCodeAt(0) === 0xFEFF) return s.slice(1);
+        return s;
+      }
+
+      function detectDelimiter(lines, candidates) {
+        var best = null;
+        var bestScore = -1;
+        for (var i = 0; i < candidates.length; i++) {
+          var d = candidates[i];
+          var counts = [];
+          var limit = Math.min(lines.length, 10);
+          for (var j = 0; j < limit; j++) {
+            var line = lines[j];
+            if (line.trim() === '') continue;
+            counts.push(line.split(d).length);
+          }
+          if (counts.length === 0) continue;
+          var ref = counts[0];
+          var consistent = 0;
+          for (var k = 0; k < counts.length; k++) {
+            if (counts[k] >= 2 && counts[k] === ref) consistent++;
+          }
+          if (consistent > bestScore) { bestScore = consistent; best = d; }
+        }
+        return best === null ? ',' : best;
+      }
+
+      function isHeaderLine(parts) {
+        if (!parts || parts.length < 2) return false;
+        for (var i = 0; i < parts.length; i++) {
+          var raw = parts[i].trim();
+          var cleaned = raw.replace(/^["']|["']$/g, '').toLowerCase();
+          if (cleaned === 'latitude' || cleaned === 'lat' || cleaned === 'longitude' || cleaned === 'lon' || cleaned === 'lng') return true;
+          if (cleaned.indexOf('latitude') === 0 || cleaned.indexOf('lat') === 0 || cleaned.indexOf('longitude') === 0 || cleaned.indexOf('lon') === 0 || cleaned.indexOf('lng') === 0) return true;
+        }
+        return false;
+      }
+
+      function findLatLonIndices(parts) {
+        var latIdx = -1, lonIdx = -1;
+        for (var i = 0; i < parts.length; i++) {
+          var raw = parts[i].trim();
+          var cleaned = raw.replace(/^["']|["']$/g, '').toLowerCase();
+          if (latIdx === -1 && (cleaned === 'latitude' || cleaned === 'lat' || cleaned.indexOf('latitude') === 0 || cleaned.indexOf('lat') === 0)) latIdx = i;
+          if (lonIdx === -1 && (cleaned === 'longitude' || cleaned === 'lon' || cleaned === 'lng' || cleaned.indexOf('longitude') === 0 || cleaned.indexOf('lon') === 0 || cleaned.indexOf('lng') === 0)) lonIdx = i;
+        }
+        return {latIdx: latIdx, lonIdx: lonIdx};
+      }
+
+      function parseNumberCell(s, delimiter) {
+        if (s === null || s === undefined) return NaN;
+        var raw = String(s).trim().replace(/^["']|["']$/g, '');
+        if (/-?\d+,\d+/.test(raw) && delimiter !== ',') raw = raw.replace(',', '.');
+        return parseFloat(raw);
+      }
+
+      function parseDelimitedText(text) {
+        if (typeof text !== 'string') throw new Error('invalid trace');
+        var content = stripBOM(text);
+        var lines = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+        var delim = detectDelimiter(lines, [',', ';', '\t']);
+        if (!lines || lines.length === 0) throw new Error('empty trace');
+        var hasHeader = isHeaderLine(lines[0].split(delim));
+        var startIdx = hasHeader ? 1 : 0;
+        var points = [];
+        var headerIdxs = hasHeader ? findLatLonIndices(lines[0].split(delim)) : {latIdx:0, lonIdx:1};
+        for (var i = startIdx; i < lines.length; i++) {
+          var line = lines[i];
+          if (line.trim() === '') continue;
+          var parts = line.split(delim);
+          var latIdx = headerIdxs.latIdx;
+          var lonIdx = headerIdxs.lonIdx;
+          if (latIdx === -1 || lonIdx === -1 || latIdx >= parts.length || lonIdx >= parts.length) {
+            if (!hasHeader) { latIdx = 0; lonIdx = 1; }
+            if (latIdx === -1 || lonIdx === -1 || latIdx >= parts.length || lonIdx >= parts.length) continue;
+          }
+          var lat = parseNumberCell(parts[latIdx], delim);
+          var lon = parseNumberCell(parts[lonIdx], delim);
+          if (!isFinite(lat) || !isFinite(lon)) continue;
+          if (Math.abs(lat) > 90 || Math.abs(lon) > 180) continue;
+          points.push({lat: lat, lng: lon});
+        }
+        if (points.length < 2) throw new Error('trace has too few valid points');
+        return points;
+      }
+
+      function parseGeoJSONText(text) {
+        if (typeof text !== 'string') throw new Error('invalid trace');
+        var content = stripBOM(text).trim();
+        var data;
+        try { data = JSON.parse(content); } catch (e) { throw new Error('invalid geojson'); }
+        var points = [];
+        function extractCoords(coords) {
+          if (!Array.isArray(coords)) return;
+          if (coords.length === 0) return;
+          if (typeof coords[0] === 'number' && typeof coords[1] === 'number') {
+            var lon = coords[0], lat = coords[1];
+            if (isFinite(lat) && isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180) {
+              points.push({lat: lat, lng: lon});
+            }
+            return;
+          }
+          for (var i = 0; i < coords.length; i++) extractCoords(coords[i]);
+        }
+        if (data.type === 'FeatureCollection' && Array.isArray(data.features)) {
+          for (var f = 0; f < data.features.length; f++) {
+            if (data.features[f] && data.features[f].geometry) extractCoords(data.features[f].geometry.coordinates);
+          }
+        } else if (data.type === 'Feature' && data.geometry) {
+          extractCoords(data.geometry.coordinates);
+        } else if (data.type === 'LineString' || data.type === 'MultiLineString') {
+          extractCoords(data.coordinates);
+        } else {
+          throw new Error('unsupported geojson');
+        }
+        if (points.length < 2) throw new Error('trace has too few valid points');
+        return points;
+      }
+
+      function parseTraceText(text) {
+        if (typeof text !== 'string') throw new Error('invalid trace');
+        var content = stripBOM(text).trim();
+        if (content.length === 0) throw new Error('empty trace');
+        if (content[0] === '{' || content[0] === '[') return parseGeoJSONText(text);
+        return parseDelimitedText(text);
+      }
+
+      function douglasPeucker(points, tolerance) {
+        if (!Array.isArray(points) || points.length <= 2) return points.slice();
+        function dist2D(p1,p2){ var dx=p1.lat-p2.lat, dy=p1.lng-p2.lng; return Math.sqrt(dx*dx+dy*dy); }
+        function perpDist(p,a,b){
+          var dx=b.lat-a.lat, dy=b.lng-a.lng;
+          var len2=dx*dx+dy*dy;
+          if (len2===0) return dist2D(p,a);
+          var t=((p.lat-a.lat)*dx+(p.lng-a.lng)*dy)/len2;
+          t=Math.max(0,Math.min(1,t));
+          var projLat=a.lat+t*dx, projLng=a.lng+t*dy;
+          var dlat=p.lat-projLat, dlng=p.lng-projLng;
+          return Math.sqrt(dlat*dlat+dlng*dlng);
+        }
+        var keep=Array(points.length).fill(false);
+        keep[0]=true; keep[points.length-1]=true;
+        function simplify(s,e){
+          if (e<=s+1) return;
+          var maxD=0, idx=s;
+          for (var i=s+1;i<e;i++){
+            var d=perpDist(points[i],points[s],points[e]);
+            if (d>maxD){ maxD=d; idx=i; }
+          }
+          if (maxD>tolerance){ keep[idx]=true; simplify(s,idx); simplify(idx,e); }
+        }
+        simplify(0,points.length-1);
+        var res=[];
+        for (var i=0;i<points.length;i++) if (keep[i]) res.push(points[i]);
+        if (res.length<2) return points.slice(0,2);
+        return res;
+      }
+
+      var App = {};
+      App.debug = {
+        parseTraceText: parseTraceText,
+        parseGeoJSONText: parseGeoJSONText,
+        parseDelimitedText: parseDelimitedText,
+        ghostPointCount: function(){ return 0; }
+      };
+      if (typeof global !== 'undefined') {
+        global.App = App;
+      }
+      if (typeof window !== 'undefined') {
+        window.App = App;
+      }
+
+      if (hasDOM) {
+        var map, ghostLayerGroup, currentTrace=null, currentFileName='';
+        App.map = null;
+        function setStatus(t){ var el=document.getElementById('status'); if(el) el.textContent=t||''; }
+        App.setStatus = setStatus;
+        function showError(msg, retryFnOrNull){
+          var banner=document.getElementById('error-banner');
+          var msgEl=document.getElementById('error-msg');
+          var retryBtn=document.getElementById('error-retry');
+          if(msgEl) msgEl.textContent=msg||'';
+          if(retryBtn){
+            if(typeof retryFnOrNull==='function'){
+              retryBtn.style.display='inline';
+              retryBtn.onclick=function(){ retryFnOrNull(); hideError(); };
+            }else{
+              retryBtn.style.display='none'; retryBtn.onclick=null;
+            }
+          }
+          if(banner) banner.classList.add('show');
+        }
+        App.showError = showError;
+        function hideError(){
+          var banner=document.getElementById('error-banner');
+          var retryBtn=document.getElementById('error-retry');
+          if(banner) banner.classList.remove('show');
+          if(retryBtn){ retryBtn.style.display='none'; retryBtn.onclick=null; }
+        }
+        App.hideError = hideError;
+        App.debug.ghostPointCount = function(){ return currentTrace?currentTrace.length:0; };
+        function renderGhost(){
+          if(ghostLayerGroup){ map.removeLayer(ghostLayerGroup); }
+          ghostLayerGroup = L.layerGroup();
+          if(currentTrace&&currentTrace.length>0){
+            var simp = douglasPeucker(currentTrace, 2e-5);
+            var latlngs=[];
+            for(var i=0;i<simp.length;i++) latlngs.push([simp[i].lat, simp[i].lng]);
+            var poly = L.polyline(latlngs,{color:'#000000',weight:3,opacity:0.6,interactive:false});
+            ghostLayerGroup.addLayer(poly);
+          }
+          ghostLayerGroup.addTo(map);
+        }
+        function handleTraceFile(file){
+          if(!file)return;
+          currentFileName=file.name||'';
+          var reader=new FileReader();
+          reader.onload=function(e){
+            try{
+              var text=e.target.result;
+              var pts=parseTraceText(text);
+              currentTrace=pts.slice();
+              var ti=document.getElementById('trace-info');
+              if(ti) ti.textContent=currentFileName+' ('+currentTrace.length+' points)';
+              renderGhost();
+              if(currentTrace.length>0){
+                var bounds=L.latLngBounds([]);
+                for(var i=0;i<currentTrace.length;i++) bounds.extend([currentTrace[i].lat,currentTrace[i].lng]);
+                map.fitBounds(bounds,{padding:[20,20]});
+              }
+              setStatus(currentFileName+' loaded: '+currentTrace.length+' points');
+              hideError();
+            }catch(err){ showError('Failed to parse trace: '+err.message,null); }
+          };
+          reader.onerror=function(){ showError('Failed to read trace file',null); };
+          reader.readAsText(file);
+        }
+        document.addEventListener('DOMContentLoaded', function(){
+          map = L.map('map',{preferCanvas:true}).setView([46.82, 8.22], 8);
+          App.map = map;
+          L.tileLayer('https://tile.openstreetmap.de/{z}/{x}/{y}.png',{attribution:'&copy; OpenStreetMap contributors | tiles: openstreetmap.de',maxZoom:21,maxNativeZoom:18}).addTo(map);
+          ghostLayerGroup = L.layerGroup().addTo(map);
+          var input=document.getElementById('trace-input');
+          if(input){ input.addEventListener('change',function(e){ var files=e.target.files; if(files&&files.length>0) handleTraceFile(files[0]); }); }
+          var dbtn=document.getElementById('error-dismiss');
+          if(dbtn){ dbtn.addEventListener('click', hideError); }
+        });
+      }
+    })();
+  </script>
+  <style>
+    .leaflet-routing-container.leaflet-bar { display: none; }
+    .wp-dot {
+      display: inline-block; width: 14px; height: 14px; box-sizing: border-box;
+      border-radius: 50%; background: #1a73e8; border: 2px solid #ffffff;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.5); vertical-align: top;
+    }
+    .wp-letter {
+      font-weight: bold; font-size: 11px; color: #ffffff; font-family: sans-serif;
+      margin-left: 2px; vertical-align: top; line-height: 14px;
+      text-shadow: 0 0 2px rgba(0,0,0,0.9), 0 0 3px rgba(0,0,0,0.7);
+      pointer-events: none; user-select: none;
+    }
+    #waypoint-list .wp-label { font-weight: bold; margin-right: 4px; display: inline-block; width: 14px; text-align: center; }
+    #waypoint-list .wp-coords { color: #555; font-size: 11px; font-family: monospace; margin-right: 6px; }
+    #waypoint-list button { min-width: 22px; }
+    #toolbar { display: grid; grid-template-columns: max-content max-content; gap: 4px; margin-top: 6px; }
+    #toolbar button { margin: 0; }
+  </style>
+  <script>
+    (function() {
+      var control = null;
+      var currentRouteCoords = null;
+
+      var segCache = new Map();
+      var inflight = new Map();
+      var snappedPositions = new Set();
+      var chainQueue = [];
+      var activeChains = 0;
+      var MAX_CHAINS = 2;
+      var OSRM_BASE = 'https://router.project-osrm.org/route/v1/driving/';
+
+      var MSG_NO_ROUTE = 'No route between these waypoints — check waypoint placement/snapping.';
+      var MSG_SERVER = 'Routing server unreachable — check connection and retry.';
+
+      function classifyRoutingError(err) {
+        if (err && err.status === 400) return MSG_NO_ROUTE;
+        return MSG_SERVER;
+      }
+
+      function round6(v) { return Math.round(v * 1e6) / 1e6; }
+
+      function roundedCoords(coords) {
+        var out = [];
+        if (!coords) return out;
+        for (var i = 0; i < coords.length; i++) {
+          var c = { lat: round6(coords[i].lat), lng: round6(coords[i].lng) };
+          var prev = out.length ? out[out.length - 1] : null;
+          if (prev && prev.lat === c.lat && prev.lng === c.lng) continue;
+          out.push(c);
+        }
+        return out;
+      }
+
+      function currentWaypoints() {
+        var out = [];
+        if (!control) return out;
+        var wps = control.getWaypoints();
+        for (var i = 0; i < wps.length; i++) {
+          if (wps[i] && wps[i].latLng) out.push(wps[i].latLng);
+        }
+        return out;
+      }
+
+      function buildExportFeature() {
+        var coords = roundedCoords(currentRouteCoords);
+        var gj = [];
+        for (var i = 0; i < coords.length; i++) gj.push([coords[i].lng, coords[i].lat]);
+        var wps = currentWaypoints();
+        return {
+          type: 'Feature',
+          properties: { exported: new Date().toISOString(), segments: Math.max(0, wps.length - 1) },
+          geometry: { type: 'LineString', coordinates: gj }
+        };
+      }
+
+      function wpKey(a, b) {
+        return a.lat.toFixed(6) + ',' + a.lng.toFixed(6) + '|' + b.lat.toFixed(6) + ',' + b.lng.toFixed(6);
+      }
+
+      function haversine(c1, c2) {
+        var R = 6371000;
+        var rad = Math.PI / 180;
+        var dLat = (c2.lat - c1.lat) * rad;
+        var dLng = (c2.lng - c1.lng) * rad;
+        var s = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+          Math.cos(c1.lat * rad) * Math.cos(c2.lat * rad) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+        return 2 * R * Math.asin(Math.min(1, Math.sqrt(s)));
+      }
+
+      function assembleRoute(segments) {
+        var merged = [];
+        var waypointIndices = [];
+        var i, j, k;
+        for (i = 0; i < segments.length; i++) {
+          var seg = segments[i];
+          if (!seg || seg.length === 0) continue;
+          for (j = 0; j < seg.length; j++) {
+            var c = { lat: seg[j].lat, lng: seg[j].lng };
+            var prev = merged.length ? merged[merged.length - 1] : null;
+            var skip = false;
+            if (prev) {
+              if (j === 0 && Math.abs(prev.lat - c.lat) < 1e-6 && Math.abs(prev.lng - c.lng) < 1e-6) skip = true;
+              else if (prev.lat === c.lat && prev.lng === c.lng) skip = true;
+            }
+            if (!skip) merged.push(c);
+            if (i === 0 && j === 0) waypointIndices.push(merged.length - 1);
+          }
+          waypointIndices.push(merged.length - 1);
+        }
+        var coordinates = [];
+        var totalDistance = 0;
+        for (k = 0; k < merged.length; k++) coordinates.push(L.latLng(merged[k].lat, merged[k].lng));
+        for (k = 1; k < merged.length; k++) totalDistance += haversine(merged[k - 1], merged[k]);
+        return { coordinates: coordinates, waypointIndices: waypointIndices, totalDistance: totalDistance };
+      }
+
+      function buildRoute(job) {
+        var asm = assembleRoute(job.segments);
+        var route = {
+          name: '',
+          coordinates: asm.coordinates,
+          instructions: [],
+          summary: { totalDistance: asm.totalDistance, totalTime: 0 },
+          inputWaypoints: job.wps,
+          waypoints: job.wps,
+          properties: { isSimplified: false }
+        };
+        if (asm.waypointIndices.length === job.wps.length) {
+          route.waypointIndices = asm.waypointIndices;
+        }
+        return route;
+      }
+
+      function fetchSegmentGeometry(key, a, b) {
+        if (inflight.has(key)) return inflight.get(key);
+        var url = OSRM_BASE + a.lng + ',' + a.lat + ';' + b.lng + ',' + b.lat +
+          '?overview=full&geometries=geojson&alternatives=false&steps=false';
+        var controller = new AbortController();
+        var timer = setTimeout(function() { controller.abort(); }, 30000);
+        var p = fetch(url, { signal: controller.signal })
+          .then(function(res) {
+            if (!res.ok) {
+              return res.text().catch(function() { return ''; }).then(function(text) {
+                throw { status: res.status, message: String(text).slice(0, 300) };
+              });
+            }
+            return res.json();
+          })
+          .then(function(data) {
+            if (data && data.code && data.code !== 'Ok') throw { status: 400, code: data.code };
+            var raw = data && data.routes && data.routes[0] && data.routes[0].geometry && data.routes[0].geometry.coordinates;
+            if (!raw || raw.length < 2) throw { status: 400, code: 'NoRoute' };
+            var geom = [];
+            for (var i = 0; i < raw.length; i++) geom.push({ lat: raw[i][1], lng: raw[i][0] });
+            return geom;
+          });
+        var tracked = p.then(function(v) {
+          clearTimeout(timer);
+          inflight.delete(key);
+          return v;
+        }, function(err) {
+          clearTimeout(timer);
+          inflight.delete(key);
+          throw err;
+        });
+        inflight.set(key, tracked);
+        return tracked;
+      }
+
+      function syncMarker(index, wp) {
+        if (!control) return;
+        var plan = control.getPlan();
+        if (!plan) return;
+        var planWps = plan.getWaypoints();
+        if (planWps[index] !== wp) return;
+        var markers = plan._markers;
+        if (markers && markers[index]) markers[index].setLatLng(wp.latLng);
+      }
+
+      function processEndpoint(index, wp, input, geomPoint) {
+        if (snappedPositions.has(input.lat + ',' + input.lng)) {
+          return { lat: input.lat, lng: input.lng };
+        }
+        var snapped = geomPoint ? { lat: geomPoint.lat, lng: geomPoint.lng } : { lat: input.lat, lng: input.lng };
+        wp.latLng = L.latLng(snapped.lat, snapped.lng);
+        snappedPositions.add(snapped.lat + ',' + snapped.lng);
+        syncMarker(index, wp);
+        rebuildWaypointList();
+        return snapped;
+      }
+
+      function runPair(job, pairIndex) {
+        if (job.cancelled || job.ended) { endJob(job); return; }
+        if (pairIndex >= job.nPairs) { endJob(job); return; }
+        var w0 = job.wps[pairIndex];
+        var w1 = job.wps[pairIndex + 1];
+        if (!w0 || !w0.latLng || !w1 || !w1.latLng) { endJob(job); return; }
+        var aC = { lat: w0.latLng.lat, lng: w0.latLng.lng };
+        var bC = { lat: w1.latLng.lat, lng: w1.latLng.lng };
+        var key = wpKey(aC, bC);
+        var cached = segCache.get(key);
+        if (cached) {
+          job.segments[pairIndex] = cached;
+          runPair(job, pairIndex + 1);
+          return;
+        }
+        fetchSegmentGeometry(key, aC, bC).then(function(geom) {
+          if (job.cancelled || job.ended) { endJob(job); return; }
+          if (w0.latLng.lat !== aC.lat || w0.latLng.lng !== aC.lng ||
+              w1.latLng.lat !== bC.lat || w1.latLng.lng !== bC.lng) {
+            endJob(job);
+            return;
+          }
+          geom[0] = processEndpoint(pairIndex, w0, aC, geom[0]);
+          geom[geom.length - 1] = processEndpoint(pairIndex + 1, w1, bC, geom[geom.length - 1]);
+          segCache.set(wpKey(geom[0], geom[geom.length - 1]), geom);
+          job.segments[pairIndex] = geom;
+          runPair(job, pairIndex + 1);
+        }, function(err) {
+          endJob(job, err || { status: -1, message: 'routing failed' });
+        });
+      }
+
+      function endJob(job, err) {
+        if (job.ended) return;
+        job.ended = true;
+        try {
+          if (!job.cancelled) {
+            if (err) {
+              App.showError(classifyRoutingError(err), makeRetry());
+              job.complete(err);
+            } else if (job.segments.length === job.nPairs) {
+              job.complete(null, [buildRoute(job)]);
+            }
+          }
+        } finally {
+          if (job.holdsSlot) {
+            job.holdsSlot = false;
+            activeChains--;
+            pumpQueue();
+          }
+        }
+      }
+
+      function pumpQueue() {
+        while (activeChains < MAX_CHAINS && chainQueue.length > 0) {
+          var job = chainQueue.shift();
+          if (job.cancelled || job.ended) continue;
+          job.holdsSlot = true;
+          activeChains++;
+          runPair(job, 0);
+        }
+      }
+
+      function makeRetry() {
+        return function() {
+          if (!control) return;
+          var wps = currentWaypoints();
+          if (wps.length > 0) control.setWaypoints(wps);
+        };
+      }
+
+      function routeSegments(waypoints, callback, context) {
+        var job = {
+          wps: [],
+          nPairs: 0,
+          segments: [],
+          cancelled: false,
+          ended: false,
+          holdsSlot: false
+        };
+        var i;
+        for (i = 0; i < waypoints.length; i++) job.wps.push(waypoints[i]);
+        job.nPairs = Math.max(0, job.wps.length - 1);
+        job.complete = function(err, routes) {
+          callback.call(context || callback, err, routes);
+        };
+        function abort() {
+          job.cancelled = true;
+          var idx = chainQueue.indexOf(job);
+          if (idx >= 0) chainQueue.splice(idx, 1);
+        }
+        if (job.nPairs === 0) return { abort: abort };
+        var preSegs = [];
+        var allCached = true;
+        for (i = 0; i < job.nPairs; i++) {
+          var a = job.wps[i].latLng;
+          var b = job.wps[i + 1].latLng;
+          if (!a || !b) { allCached = false; break; }
+          var g = segCache.get(wpKey(a, b));
+          if (!g) { allCached = false; break; }
+          preSegs.push(g);
+        }
+        if (allCached) {
+          job.segments = preSegs;
+          Promise.resolve().then(function() {
+            if (job.cancelled || job.ended) return;
+            job.ended = true;
+            job.complete(null, [buildRoute(job)]);
+          });
+          return { abort: abort };
+        }
+        chainQueue.push(job);
+        pumpQueue();
+        return { abort: abort };
+      }
+
+      var segmentRouter = { route: routeSegments };
+
+      App.debug.activeWaypoints = function() {
+        var out = [];
+        var wps = currentWaypoints();
+        for (var i = 0; i < wps.length; i++) out.push({ lat: wps[i].lat, lng: wps[i].lng });
+        return out;
+      };
+      App.debug.routeCoordCount = function() { return currentRouteCoords ? currentRouteCoords.length : 0; };
+      App.debug.segments = function() {
+        var wps = currentWaypoints();
+        var out = [];
+        for (var i = 0; i + 1 < wps.length; i++) {
+          var geom = segCache.get(wpKey(wps[i], wps[i + 1]));
+          var copy = [];
+          if (geom) {
+            for (var j = 0; j < geom.length; j++) copy.push({ lat: geom[j].lat, lng: geom[j].lng });
+          }
+          out.push(copy);
+        }
+        return out;
+      };
+      App.debug.waypointCount = function() { return currentWaypoints().length; };
+      App.debug.exportFeature = function() { return buildExportFeature(); };
+
+      function createMarker(i, wp, n) {
+        var icon = L.divIcon({
+          className: '',
+          html: '<span class="wp-dot"></span><span class="wp-letter">' + String.fromCharCode(65 + (i % 26)) + '</span>',
+          iconSize: [14, 14],
+          iconAnchor: [7, 7]
+        });
+        return L.marker(wp.latLng, { draggable: true, icon: icon });
+      }
+
+      function rebuildWaypointList() {
+        var list = document.getElementById('waypoint-list');
+        if (!list) return;
+        while (list.firstChild) list.removeChild(list.firstChild);
+        var wps = currentWaypoints();
+        var canRemove = wps.length >= 2;
+        for (var i = 0; i < wps.length; i++) {
+          var li = document.createElement('li');
+          li.setAttribute('data-index', String(i));
+          var label = document.createElement('span');
+          label.className = 'wp-label';
+          label.textContent = String.fromCharCode(65 + (i % 26));
+          var coords = document.createElement('span');
+          coords.className = 'wp-coords';
+          coords.textContent = wps[i].lat.toFixed(5) + ', ' + wps[i].lng.toFixed(5);
+          li.appendChild(label);
+          li.appendChild(coords);
+          li.appendChild(makeListButton('up', i, 'Move up', '▲', i === 0));
+          li.appendChild(makeListButton('down', i, 'Move down', '▼', i === wps.length - 1));
+          li.appendChild(makeListButton('remove', i, 'Remove waypoint', '×', !canRemove));
+          list.appendChild(li);
+        }
+      }
+
+      function makeListButton(action, index, label, text, disabled) {
+        var b = document.createElement('button');
+        b.setAttribute('type', 'button');
+        b.setAttribute('data-action', action);
+        b.title = label;
+        b.setAttribute('aria-label', label);
+        b.textContent = text;
+        if (disabled) b.disabled = true;
+        return b;
+      }
+
+      function refresh() {
+        rebuildWaypointList();
+        var expBtn = document.getElementById('btn-export');
+        if (expBtn) expBtn.disabled = roundedCoords(currentRouteCoords).length < 2;
+        var zoomBtn = document.getElementById('btn-zoom-all');
+        if (zoomBtn) zoomBtn.disabled = !hasAnythingToFit();
+        var saveBtn = document.getElementById('btn-save-waypoints');
+        if (saveBtn) saveBtn.disabled = App.debug.activeWaypoints().length === 0;
+      }
+
+      function buildSavePayload() {
+        var wps = App.debug.activeWaypoints();
+        var segs = App.debug.segments();
+        var waypoints = [];
+        for (var j = 0; j < wps.length; j++) {
+          waypoints.push([wps[j].lat, wps[j].lng]);
+        }
+        var segments = [];
+        for (var s = 0; s < segs.length; s++) {
+          var seg = segs[s];
+          var coords = [];
+          if (seg) {
+            for (var k = 0; k < seg.length; k++) {
+              coords.push([seg[k].lat, seg[k].lng]);
+            }
+          }
+          segments.push(coords);
+        }
+        return {
+          version: 2,
+          saved: new Date().toISOString(),
+          waypoints: waypoints,
+          segments: segments
+        };
+      }
+
+      function onSaveWaypointsClick() {
+        if (App.debug.activeWaypoints().length === 0) return;
+        var payload = buildSavePayload();
+        var blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = 'route-waypoints.json';
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
+        App.setStatus('waypoints saved');
+      }
+
+      function validateSaveData(data) {
+        if (!data || typeof data !== 'object' || Array.isArray(data)) return 'not a JSON object';
+        if (data.version !== 2) return 'unsupported version';
+        if (!Array.isArray(data.waypoints)) return 'waypoints is not an array';
+        for (var j = 0; j < data.waypoints.length; j++) {
+          var p = data.waypoints[j];
+          if (!Array.isArray(p) || p.length < 2) return 'waypoint ' + j + ' is not a [lat,lng] pair';
+          var lat = p[0], lng = p[1];
+          if (typeof lat !== 'number' || typeof lng !== 'number' || !isFinite(lat) || !isFinite(lng)) {
+            return 'waypoint ' + j + ' is not finite numbers';
+          }
+          if (Math.abs(lat) > 90) return 'waypoint ' + j + ' latitude out of range';
+          if (Math.abs(lng) > 180) return 'waypoint ' + j + ' longitude out of range';
+        }
+        if (!Array.isArray(data.segments)) return 'segments is not an array';
+        var expectedSegs = Math.max(0, data.waypoints.length - 1);
+        if (data.segments.length !== expectedSegs) return 'segments length mismatch';
+        for (var s = 0; s < data.segments.length; s++) {
+          var seg = data.segments[s];
+          if (!Array.isArray(seg)) return 'segment ' + s + ' is not an array';
+          if (seg.length === 0) return 'segment ' + s + ' is empty';
+          for (var i = 0; i < seg.length; i++) {
+            var sp = seg[i];
+            if (!Array.isArray(sp) || sp.length < 2) return 'segment ' + s + ' point ' + i + ' is not a [lat,lng] pair';
+            var slat = sp[0], slng = sp[1];
+            if (typeof slat !== 'number' || typeof slng !== 'number' || !isFinite(slat) || !isFinite(slng)) {
+              return 'segment ' + s + ' point ' + i + ' is not finite numbers';
+            }
+            if (Math.abs(slat) > 90) return 'segment ' + s + ' point ' + i + ' latitude out of range';
+            if (Math.abs(slng) > 180) return 'segment ' + s + ' point ' + i + ' longitude out of range';
+          }
+        }
+        return null;
+      }
+
+      function seedCacheFromV2(waypoints, segments) {
+        for (var s = 0; s < segments.length; s++) {
+          var seg = segments[s];
+          if (!seg || seg.length < 2) continue;
+          var w0 = { lat: waypoints[s][0], lng: waypoints[s][1] };
+          var w1 = { lat: waypoints[s + 1][0], lng: waypoints[s + 1][1] };
+          var geom = [];
+          for (var k = 0; k < seg.length; k++) {
+            geom.push({ lat: seg[k][0], lng: seg[k][1] });
+          }
+          segCache.set(wpKey(w0, w1), geom);
+        }
+      }
+      App.debug.seedCache = function(waypoints, segments) {
+        seedCacheFromV2(waypoints, segments);
+      };
+
+      function applyLoadedState(data) {
+        var i, j;
+        var waypoints = data.waypoints;
+        var segments = data.segments || [];
+        currentRouteCoords = null;
+        snappedPositions.clear();
+        var wps = [];
+        for (i = 0; i < waypoints.length; i++) {
+          var p = waypoints[i];
+          var lat = p[0], lng = p[1];
+          wps.push(L.latLng(lat, lng));
+          snappedPositions.add(lat + ',' + lng);
+        }
+        var autoRoutePrev = control.options.autoRoute;
+        control.options.autoRoute = false;
+        control.setWaypoints(wps);
+        control.options.autoRoute = autoRoutePrev;
+        seedCacheFromV2(waypoints, segments);
+        var segObjs = [];
+        for (i = 0; i < segments.length; i++) {
+          var s = segments[i];
+          var arr = [];
+          if (s) {
+            for (j = 0; j < s.length; j++) {
+              arr.push({ lat: s[j][0], lng: s[j][1] });
+            }
+          }
+          segObjs.push(arr);
+        }
+        var asm = assembleRoute(segObjs);
+        var routeCoords = asm.coordinates || [];
+        var canDrawRoute = waypoints.length >= 2 && routeCoords.length >= 2;
+        if (!canDrawRoute) {
+          currentRouteCoords = null;
+          if (typeof control._clearLines === 'function') control._clearLines();
+          if (typeof control._clearAlts === 'function') control._clearAlts();
+          refresh();
+          App.setStatus('waypoints loaded (' + wps.length + ' waypoints)');
+          return;
+        }
+        var route = {
+          name: '',
+          coordinates: routeCoords,
+          instructions: [],
+          summary: { totalDistance: asm.totalDistance || 0, totalTime: 0 },
+          inputWaypoints: control.getWaypoints(),
+          waypoints: control.getWaypoints(),
+          properties: { isSimplified: false },
+          routesIndex: 0
+        };
+        if (asm.waypointIndices && asm.waypointIndices.length === wps.length) {
+          route.waypointIndices = asm.waypointIndices;
+        }
+        currentRouteCoords = [];
+        for (i = 0; i < routeCoords.length; i++) {
+          currentRouteCoords.push({ lat: routeCoords[i].lat, lng: routeCoords[i].lng });
+        }
+        control.setAlternatives([route]);
+        try {
+          control.fire('routesfound', { routes: [route], waypoints: control.getWaypoints() });
+        } catch (e) {}
+        refresh();
+        App.setStatus('waypoints loaded (' + wps.length + ' waypoints)');
+      }
+
+      function handleWaypointText(text) {
+        var data;
+        try {
+          data = JSON.parse(text);
+        } catch (err) {
+          App.showError('Invalid waypoints file: not valid JSON', null);
+          return;
+        }
+        var reason = validateSaveData(data);
+        if (reason) {
+          App.showError('Unsupported save file - this version reads version 2 (waypoints + segments).', null);
+          return;
+        }
+        var hasState = App.debug.activeWaypoints().length > 0;
+        if (hasState && !confirm('Replace the current waypoints?')) {
+          App.setStatus('load cancelled');
+          return;
+        }
+        applyLoadedState(data);
+      }
+
+      function onWaypointFileChange(e) {
+        var input = e.target;
+        var files = input.files;
+        if (!files || files.length === 0) return;
+        var file = files[0];
+        var reader = new FileReader();
+        reader.onload = function(ev) {
+          input.value = '';
+          handleWaypointText(ev.target.result);
+        };
+        reader.onerror = function() {
+          input.value = '';
+          App.showError('Invalid waypoints file: could not read file', null);
+        };
+        reader.readAsText(file);
+      }
+
+      function hasAnythingToFit() {
+        if (currentRouteCoords && currentRouteCoords.length > 0) return true;
+        return currentWaypoints().length > 0;
+      }
+
+      function computeAllBounds() {
+        var bounds = L.latLngBounds([]);
+        var i;
+        if (currentRouteCoords) {
+          for (i = 0; i < currentRouteCoords.length; i++) bounds.extend([currentRouteCoords[i].lat, currentRouteCoords[i].lng]);
+        }
+        var wps = currentWaypoints();
+        for (i = 0; i < wps.length; i++) bounds.extend(wps[i]);
+        return bounds;
+      }
+
+      function onZoomAllClick() {
+        if (!hasAnythingToFit()) {
+          App.setStatus('nothing to fit yet');
+          return;
+        }
+        var bounds = computeAllBounds();
+        if (!bounds.isValid()) {
+          App.setStatus('nothing to fit yet');
+          return;
+        }
+        App.map.fitBounds(bounds, { padding: [40, 40] });
+      }
+
+      function onMapClick(e) {
+        if (!control) return;
+        var wps = currentWaypoints();
+        for (var i = 0; i < wps.length; i++) {
+          if (e.latlng.distanceTo(wps[i]) < 1) return;
+        }
+        wps.push(e.latlng);
+        control.setWaypoints(wps);
+      }
+
+      function onWaypointsChanged() {
+        currentRouteCoords = null;
+        refresh();
+      }
+
+      function onRoutesFound(e) {
+        var coords = [];
+        var route = e.routes && e.routes[0];
+        if (route && route.coordinates) {
+          for (var i = 0; i < route.coordinates.length; i++) {
+            coords.push({ lat: route.coordinates[i].lat, lng: route.coordinates[i].lng });
+          }
+        }
+        currentRouteCoords = coords.length >= 2 ? coords : null;
+        App.setStatus('route updated');
+        refresh();
+      }
+
+      function onRoutingError(e) {
+        currentRouteCoords = null;
+        var message = classifyRoutingError(e && e.error);
+        var retryWps = currentWaypoints();
+        App.showError(message, function() {
+          if (control && retryWps.length) control.setWaypoints(retryWps);
+        });
+        refresh();
+      }
+
+      function onWaypointListClick(e) {
+        var btn = e.target;
+        if (!btn || btn.tagName !== 'BUTTON' || btn.disabled) return;
+        var li = btn.parentNode;
+        var idx = parseInt(li.getAttribute('data-index'), 10);
+        if (isNaN(idx)) return;
+        var action = btn.getAttribute('data-action');
+        var latlngs = currentWaypoints();
+        for (var i = 0; i < latlngs.length; i++) latlngs[i] = L.latLng(latlngs[i].lat, latlngs[i].lng);
+        var tmp;
+        if (action === 'up' && idx > 0) {
+          tmp = latlngs[idx - 1]; latlngs[idx - 1] = latlngs[idx]; latlngs[idx] = tmp;
+          control.setWaypoints(latlngs);
+        } else if (action === 'down' && idx < latlngs.length - 1) {
+          tmp = latlngs[idx + 1]; latlngs[idx + 1] = latlngs[idx]; latlngs[idx] = tmp;
+          control.setWaypoints(latlngs);
+        } else if (action === 'remove' && latlngs.length >= 2) {
+          latlngs.splice(idx, 1);
+          control.setWaypoints(latlngs);
+        }
+      }
+
+      function onExportClick() {
+        var feature = buildExportFeature();
+        if (feature.geometry.coordinates.length < 2) {
+          App.showError('Nothing routed yet — place at least two waypoints.', null);
+          return;
+        }
+        var blob = new Blob([JSON.stringify(feature)], { type: 'application/geo+json' });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = 'reference-route.geojson';
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
+        App.setStatus('exported');
+      }
+
+      function initRouting() {
+        if (typeof L === 'undefined' || !L.Routing || !App || !App.map) return;
+        var map = App.map;
+        control = L.Routing.control({
+          waypoints: [],
+          router: segmentRouter,
+          show: false,
+          showAlternatives: false,
+          routeWhileDragging: false,
+          addWaypoints: true,
+          draggableWaypoints: true,
+          fitSelectedRoutes: false,
+          createMarker: createMarker,
+          lineOptions: {
+            styles: [
+              {color: 'black', opacity: 0.15, weight: 9},
+              {color: 'white', opacity: 0.8, weight: 6},
+              {color: '#1a73e8', opacity: 1, weight: 2}
+            ]
+          },
+          defaultErrorHandler: function() {}
+        }).addTo(map);
+        map.on('click', onMapClick);
+        control.on('waypointschanged', onWaypointsChanged);
+        control.on('routesfound', onRoutesFound);
+        control.on('routingerror', onRoutingError);
+        var expBtn = document.getElementById('btn-export');
+        if (expBtn) {
+          expBtn.disabled = true;
+          expBtn.addEventListener('click', onExportClick);
+        }
+        var zoomBtn = document.getElementById('btn-zoom-all');
+        if (zoomBtn) {
+          zoomBtn.disabled = true;
+          zoomBtn.addEventListener('click', onZoomAllClick);
+        }
+        var saveBtn = document.getElementById('btn-save-waypoints');
+        if (saveBtn) {
+          saveBtn.disabled = true;
+          saveBtn.addEventListener('click', onSaveWaypointsClick);
+        }
+        var loadBtn = document.getElementById('btn-load-waypoints');
+        if (loadBtn) {
+          loadBtn.disabled = false;
+          loadBtn.addEventListener('click', function() {
+            var fi = document.getElementById('waypoint-file');
+            if (fi) fi.click();
+          });
+        }
+        var wpFile = document.getElementById('waypoint-file');
+        if (wpFile) wpFile.addEventListener('change', onWaypointFileChange);
+        var list = document.getElementById('waypoint-list');
+        if (list) list.addEventListener('click', onWaypointListClick);
+        refresh();
+      }
+
+      document.addEventListener('DOMContentLoaded', initRouting);
+    })();
+  </script>
+</body>
+</html>
